@@ -9,6 +9,17 @@ static void die_oom(const char *what) {
   exit(1);
 }
 
+static bool starts_with(const char *s, const char *prefix) {
+  size_t n = strlen(prefix);
+  return strncmp(s, prefix, n) == 0;
+}
+
+static bool ends_with(const char *s, const char *suffix) {
+  size_t n1 = strlen(s);
+  size_t n2 = strlen(suffix);
+  return n1 >= n2 && !strcmp(s + n1 - n2, suffix);
+}
+
 typedef struct {
   char **data;
   int len;
@@ -38,7 +49,13 @@ typedef struct {
   bool verbose;
   StrVec include_paths;
   StrVec defines;
-  StrVec inputs;      // .c/.o/.a/.so/... (non-option inputs)
+  StrVec inputs;      // all non-option inputs, in argv order
+  StrVec c_inputs;    // *.c
+  StrVec asm_inputs;  // *.s
+  StrVec obj_inputs;  // *.o
+  StrVec ar_inputs;   // *.a
+  StrVec so_inputs;   // *.so
+  StrVec other_inputs;
   StrVec ld_args;     // -Wl, -l, -L, -Xlinker ...
   const char *output; // -o <path>
   bool opt_c;
@@ -53,6 +70,12 @@ static Options opt = {
     .include_paths = {},
     .defines = {},
     .inputs = {},
+    .c_inputs = {},
+    .asm_inputs = {},
+    .obj_inputs = {},
+    .ar_inputs = {},
+    .so_inputs = {},
+    .other_inputs = {},
     .ld_args = {},
     .output = NULL,
     .opt_c = false,
@@ -177,7 +200,22 @@ static bool opt_set_verbose(Options *opt, int nargs, const char **values) {
 static bool opt_set_input(Options *opt, int nargs, const char **values) {
   if (nargs != 1)
     return false;
-  strvec_push(&opt->inputs, values[0]);
+  const char *path = values[0];
+  strvec_push(&opt->inputs, path);
+
+  if (ends_with(path, ".c")) {
+    strvec_push(&opt->c_inputs, path);
+  } else if (ends_with(path, ".s")) {
+    strvec_push(&opt->asm_inputs, path);
+  } else if (ends_with(path, ".o")) {
+    strvec_push(&opt->obj_inputs, path);
+  } else if (ends_with(path, ".a")) {
+    strvec_push(&opt->ar_inputs, path);
+  } else if (ends_with(path, ".so")) {
+    strvec_push(&opt->so_inputs, path);
+  } else {
+    strvec_push(&opt->other_inputs, path);
+  }
   return true;
 }
 
@@ -240,11 +278,6 @@ static void print_help(FILE *out) {
 }
 
 static void print_errhint() { fprintf(stderr, "hint: try --help\n"); }
-
-static bool starts_with(const char *s, const char *prefix) {
-  size_t n = strlen(prefix);
-  return strncmp(s, prefix, n) == 0;
-}
 
 static bool match_option(const OptionSpec *spec, const char *arg,
                          const char **inline_value) {
@@ -409,6 +442,43 @@ static void dump_options(FILE *out, const Options *opt) {
   fprintf(out, "inputs(%d):\n", opt->inputs.len);
   for (int i = 0; i < opt->inputs.len; i++)
     fprintf(out, "  %s\n", opt->inputs.data[i]);
+
+  fprintf(out, "c_inputs(%d):\n", opt->c_inputs.len);
+  for (int i = 0; i < opt->c_inputs.len; i++)
+    fprintf(out, "  %s\n", opt->c_inputs.data[i]);
+
+  fprintf(out, "asm_inputs(%d):\n", opt->asm_inputs.len);
+  for (int i = 0; i < opt->asm_inputs.len; i++)
+    fprintf(out, "  %s\n", opt->asm_inputs.data[i]);
+
+  fprintf(out, "obj_inputs(%d):\n", opt->obj_inputs.len);
+  for (int i = 0; i < opt->obj_inputs.len; i++)
+    fprintf(out, "  %s\n", opt->obj_inputs.data[i]);
+
+  fprintf(out, "ar_inputs(%d):\n", opt->ar_inputs.len);
+  for (int i = 0; i < opt->ar_inputs.len; i++)
+    fprintf(out, "  %s\n", opt->ar_inputs.data[i]);
+
+  fprintf(out, "so_inputs(%d):\n", opt->so_inputs.len);
+  for (int i = 0; i < opt->so_inputs.len; i++)
+    fprintf(out, "  %s\n", opt->so_inputs.data[i]);
+
+  fprintf(out, "other_inputs(%d):\n", opt->other_inputs.len);
+  for (int i = 0; i < opt->other_inputs.len; i++)
+    fprintf(out, "  %s\n", opt->other_inputs.data[i]);
+}
+
+static void validate_options(const Options *opt) {
+  if (opt->opt_E && (opt->opt_c || opt->opt_S))
+    DIE_HINT("conflicting options: -E cannot be used with -c or -S");
+
+  if (opt->opt_c && opt->opt_S)
+    DIE_HINT("conflicting options: -c cannot be used with -S");
+
+  // For per-input outputs (-E/-S/-c), using a single -o with multiple inputs
+  // is ambiguous. GCC/clang reject it, and so does chibicc.
+  if (opt->output && opt->inputs.len > 1 && (opt->opt_E || opt->opt_S || opt->opt_c))
+    DIE_HINT("cannot specify -o with -E, -S or -c when multiple input files are given");
 }
 
 
@@ -426,5 +496,8 @@ int main(int argc, char **argv) {
   if (opt.inputs.len == 0) {
     DIE_HINT("no input file");
   }
+  validate_options(&opt);
+
+  
   return 0;
 }
