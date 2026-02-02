@@ -1,256 +1,206 @@
-#include <ctype.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-typedef enum {
-  TK_IDENT,
-  TK_NUM,
-  TK_PUNCT,
-  TK_KEYWORD,
-  TK_EOF,
-} TokenKind;
+/* section: preprocess part */
 
-typedef struct Token Token;
-struct Token {
-  TokenKind kind;
-  Token *next;
-  long val;
-  char *loc;
-  int len;
+/* section: lexical analysis */
+
+/* section: parse arguments */
+typedef struct {
+  bool dump_tokens;
+  bool dump_codegen;
+  const char *input_path;
+} Options;
+
+typedef struct {
+  const char *names[3];
+  const char *help;
+  int nargs;
+  bool (*apply)(Options *opt, int nargs, const char **values);
+} OptionSpec;
+
+static Options opt = {
+    .dump_tokens = false,
+    .dump_codegen = true,
+    .input_path = NULL,
 };
 
-typedef enum {
-  ND_NUM,
-  ND_RETURN,
-} NodeKind;
+static void print_help(FILE *out);
+static void print_errhint();
 
-typedef struct Node Node;
-struct Node {
-  NodeKind kind;
-  Node *lhs;
-  long val;
-};
-
-static char *current_input;
-static char *current_filename;
-static Token *token;
-
-static void error_at(char *loc, char *fmt, ...) {
-  va_list ap;
-  int pos = loc - current_input;
-
-  fprintf(stderr, "%s\n", current_input);
-  fprintf(stderr, "%*s", pos, "");
-  fprintf(stderr, "^ ");
-
-  va_start(ap, fmt);
-  vfprintf(stderr, fmt, ap);
-  va_end(ap);
-  fprintf(stderr, "\n");
-  exit(1);
-}
-
-static void error_tok(Token *tok, char *fmt, ...) {
-  va_list ap;
-  int pos = tok->loc - current_input;
-
-  fprintf(stderr, "%s\n", current_input);
-  fprintf(stderr, "%*s", pos, "");
-  fprintf(stderr, "^ ");
-
-  va_start(ap, fmt);
-  vfprintf(stderr, fmt, ap);
-  va_end(ap);
-  fprintf(stderr, "\n");
-  exit(1);
-}
-
-static bool equal(Token *tok, char *op) {
-  return tok->kind == TK_PUNCT && strlen(op) == (size_t)tok->len &&
-         !strncmp(tok->loc, op, tok->len);
-}
-
-static Token *skip(Token *tok, char *op) {
-  if (!equal(tok, op))
-    error_tok(tok, "expected '%s'", op);
-  return tok->next;
-}
-
-static bool is_keyword(Token *tok, char *kw) {
-  return tok->kind == TK_KEYWORD && strlen(kw) == (size_t)tok->len &&
-         !strncmp(tok->loc, kw, tok->len);
-}
-
-static bool consume_keyword(Token **rest, Token *tok, char *kw) {
-  if (!is_keyword(tok, kw))
-    return false;
-  *rest = tok->next;
+static bool opt_set_dump_tokens(Options *opt, int nargs, const char **values) {
+  (void)nargs;
+  (void)values;
+  opt->dump_tokens = true;
   return true;
 }
 
-static Token *new_token(TokenKind kind, char *start, char *end) {
-  Token *tok = calloc(1, sizeof(Token));
-  tok->kind = kind;
-  tok->loc = start;
-  tok->len = end - start;
-  return tok;
+static bool opt_set_no_codegen(Options *opt, int nargs, const char **values) {
+  (void)nargs;
+  (void)values;
+  opt->dump_codegen = false;
+  return true;
 }
 
-static bool is_ident1(int c) {
-  return isalpha(c) || c == '_';
+static bool opt_set_input(Options *opt, int nargs, const char **values) {
+  if (nargs != 1)
+    return false;
+  opt->input_path = values[0];
+  return true;
 }
 
-static bool is_ident2(int c) {
-  return isalnum(c) || c == '_';
+static bool opt_help(Options *opt, int nargs, const char **values) {
+  (void)opt;
+  (void)nargs;
+  (void)values;
+  print_help(stdout);
+  exit(0);
+  return true;
 }
 
-static Token *tokenize(char *p) {
-  Token head = {};
-  Token *cur = &head;
+#define OPT1(name1, helpstr, nargs_, applyfn)                                  \
+  {{(name1), NULL, NULL}, (helpstr), (nargs_), (applyfn)}
 
-  while (*p) {
-    if (isspace(*p)) {
-      p++;
+#define OPT2(name1, name2, helpstr, nargs_, applyfn)                           \
+  {{(name1), (name2), NULL}, (helpstr), (nargs_), (applyfn)}
+
+#define OPT3(name1, name2, name3, helpstr, nargs_, applyfn)                    \
+  {{(name1), (name2), (name3)}, (helpstr), (nargs_), (applyfn)}
+
+static const OptionSpec specs[] = {
+    OPT2("-h", "--help", "show this help", 0, opt_help),
+    OPT1("--tokens", "dump tokens then continue", 0, opt_set_dump_tokens),
+    OPT1("--no-codegen", "parse only; do not emit code", 0, opt_set_no_codegen),
+};
+
+static const size_t specs_len = sizeof(specs) / sizeof(*specs);
+
+static void print_help(FILE *out) {
+  fprintf(out, "usage: feipiaocc <file> [options]\n");
+  fprintf(out, "options:\n");
+  for (size_t i = 0; i < specs_len; i++) {
+    const OptionSpec *s = &specs[i];
+    fprintf(out, "  ");
+    for (size_t j = 0; j < sizeof(s->names) / sizeof(*s->names); j++) {
+      const char *name = s->names[j];
+      if (!name)
+        break;
+      if (j != 0)
+        fprintf(out, ", ");
+      fprintf(out, "%s", name);
+    }
+    fprintf(out, "%s%s\n", s->help ? "\t" : "", s->help ? s->help : "");
+  }
+}
+
+static void print_errhint() { fprintf(stderr, "hint: try --help\n"); }
+
+static bool match_option_name(const OptionSpec *spec, const char *arg) {
+  for (size_t i = 0; i < sizeof(spec->names) / sizeof(*spec->names); i++) {
+    const char *name = spec->names[i];
+    if (!name)
+      break;
+    if (!strcmp(arg, name))
+      return true;
+  }
+  return false;
+}
+
+static bool is_known_option(const char *arg) {
+  if (!arg || arg[0] != '-' || arg[1] == '\0')
+    return false;
+  for (size_t i = 0; i < specs_len; i++)
+    if (match_option_name(&specs[i], arg))
+      return true;
+  return false;
+}
+
+#define ERRORF(...)                      \
+  do {                                   \
+    fprintf(stderr, "error: ");          \
+    fprintf(stderr, __VA_ARGS__);        \
+    fprintf(stderr, "\n");               \
+  } while (0)
+
+#define DIE(...)                         \
+  do {                                   \
+    ERRORF(__VA_ARGS__);                 \
+    exit(1);                             \
+  } while (0)
+
+#define DIE_HINT(...)                    \
+  do {                                   \
+    ERRORF(__VA_ARGS__);                 \
+    print_errhint();                     \
+    exit(1);                             \
+  } while (0)
+
+void parse_argv(int argc, char **argv) {
+  bool stop_options = false;
+
+  for (int i = 1; i < argc; i++) {
+    char *arg = argv[i];
+
+    if (!stop_options && !strcmp(arg, "--")) {
+      stop_options = true;
       continue;
     }
 
-    if (!strncmp(p, "return", 6) && !is_ident2(p[6])) {
-      cur = cur->next = new_token(TK_KEYWORD, p, p + 6);
-      p += 6;
+    if (!stop_options && arg[0] == '-') {
+      const OptionSpec *spec = NULL;
+      for (size_t j = 0; j < specs_len; j++) {
+        if (match_option_name(&specs[j], arg)) {
+          spec = &specs[j];
+          break;
+        }
+      }
+
+      if (!spec) {
+        DIE_HINT("unknown option: %s", arg);
+      }
+
+      const char **values = NULL;
+      if (spec->nargs < 0)
+        DIE("invalid nargs=%d for %s", spec->nargs, arg);
+
+      if (spec->nargs != 0) {
+        if (i + spec->nargs >= argc)
+          DIE_HINT("option requires %d argument(s): %s", spec->nargs, arg);
+
+        values = calloc((size_t)spec->nargs, sizeof(*values));
+        for (int n = 0; n < spec->nargs; n++) {
+          char *v = argv[i + 1];
+          if (is_known_option(v))
+            DIE_HINT("option requires %d argument(s): %s", spec->nargs, arg);
+          values[n] = argv[++i];
+        }
+      }
+
+      bool ok = spec->apply(&opt, spec->nargs, values);
+      free(values);
+      if (!ok)
+        DIE("failed to apply option: %s", arg);
       continue;
     }
 
-    if (is_ident1(*p)) {
-      char *start = p;
-      p++;
-      while (is_ident2(*p))
-        p++;
-      cur = cur->next = new_token(TK_IDENT, start, p);
-      continue;
+    if (opt.input_path) {
+      DIE_HINT("multiple input files: %s", arg);
     }
 
-    if (isdigit(*p)) {
-      char *start = p;
-      long val = strtol(p, &p, 10);
-      cur = cur->next = new_token(TK_NUM, start, p);
-      cur->val = val;
-      continue;
-    }
-
-    if (*p == ';') {
-      cur = cur->next = new_token(TK_PUNCT, p, p + 1);
-      p++;
-      continue;
-    }
-
-    error_at(p, "invalid token");
+    const char *v[] = {arg};
+    if (!opt_set_input(&opt, 1, v))
+      DIE("failed to set input file: %s", arg);
   }
 
-  cur->next = new_token(TK_EOF, p, p);
-  return head.next;
-}
-
-static Node *new_node(NodeKind kind) {
-  Node *node = calloc(1, sizeof(Node));
-  node->kind = kind;
-  return node;
-}
-
-static Node *new_num(long val) {
-  Node *node = new_node(ND_NUM);
-  node->val = val;
-  return node;
-}
-
-static Node *expr(void) {
-  if (token->kind != TK_NUM)
-    error_tok(token, "expected a number");
-  Node *node = new_num(token->val);
-  token = token->next;
-  return node;
-}
-
-static Node *stmt(void) {
-  if (consume_keyword(&token, token, "return")) {
-    Node *node = new_node(ND_RETURN);
-    node->lhs = expr();
-    token = skip(token, ";");
-    return node;
+  if (!opt.input_path) {
+    DIE_HINT("no input file");
   }
-
-  error_tok(token, "expected 'return'");
-  return NULL;
-}
-
-static Node *parse(Token *tok) {
-  token = tok;
-  Node *node = stmt();
-  if (token->kind != TK_EOF)
-    error_tok(token, "extra tokens");
-  return node;
-}
-
-static void gen_expr(Node *node) {
-  if (node->kind != ND_NUM)
-    return;
-  printf("  mov $%ld, %%rax\n", node->val);
-}
-
-static void gen_stmt(Node *node) {
-  if (node->kind != ND_RETURN)
-    return;
-  gen_expr(node->lhs);
-  printf("  jmp .L.return\n");
-}
-
-static void codegen(Node *node) {
-  printf("  .globl main\n");
-  printf("  .text\n");
-  printf("main:\n");
-  printf("  push %%rbp\n");
-  printf("  mov %%rsp, %%rbp\n");
-  gen_stmt(node);
-  printf(".L.return:\n");
-  printf("  mov %%rbp, %%rsp\n");
-  printf("  pop %%rbp\n");
-  printf("  ret\n");
-}
-
-static char *read_file(char *path) {
-  FILE *fp = fopen(path, "r");
-  if (!fp) {
-    fprintf(stderr, "cannot open %s\n", path);
-    exit(1);
-  }
-
-  fseek(fp, 0, SEEK_END);
-  size_t size = ftell(fp);
-  fseek(fp, 0, SEEK_SET);
-
-  char *buf = calloc(1, size + 2);
-  fread(buf, 1, size, fp);
-  fclose(fp);
-
-  if (size == 0 || buf[size - 1] != '\n')
-    buf[size++] = '\n';
-  buf[size] = '\0';
-  return buf;
 }
 
 int main(int argc, char **argv) {
-  if (argc != 2) {
-    fprintf(stderr, "usage: feipiaocc <file>\n");
-    return 1;
-  }
-
-  current_filename = argv[1];
-  current_input = read_file(current_filename);
-
-  Token *tok = tokenize(current_input);
-  Node *node = parse(tok);
-  codegen(node);
+  parse_argv(argc, argv);
+  (void)opt;
   return 0;
 }
