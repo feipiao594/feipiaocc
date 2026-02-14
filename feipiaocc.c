@@ -98,7 +98,6 @@ typedef struct {
   bool (*apply)(Options *opt, int nargs, const char **values);
 } OptionSpec;
 
-
 static void print_help(FILE *out);
 static void print_errhint();
 
@@ -151,7 +150,8 @@ static bool opt_add_ld_arg(Options *opt, int nargs, const char **values) {
   return true;
 }
 
-static bool opt_add_ld_arg_literal(Options *opt, int nargs, const char **values) {
+static bool opt_add_ld_arg_literal(Options *opt, int nargs,
+                                   const char **values) {
   // Pass through the original argv token like "-lfoo".
   if (nargs != 1)
     return false;
@@ -243,20 +243,21 @@ static bool opt_help(Options *opt, int nargs, const char **values) {
   {{(prefix), NULL, NULL}, (helpstr), (nargs_), OPT_MATCH_PREFIX, (applyfn)}
 
 static const OptionSpec specs[] = {
-  OPTP1("-o", "set output path", 1, opt_set_output),
-  OPT1("-c", "compile and assemble, but do not link", 0, opt_set_c),
-  OPT1("-S", "compile only; do not assemble or link", 0, opt_set_S),
-  OPT1("-E", "preprocess only", 0, opt_set_E),
-  OPTP1("-I", "add include search path", 1, opt_add_include_path),
-  OPTP1("-D", "define macro (NAME or NAME=VALUE)", 1, opt_add_define),
-  OPTP1("-Wl", "pass comma-separated args to linker", 1, opt_add_Wl),
-  OPTP1("-l", "link with library (pass through to linker)", 1, opt_add_ld_arg_literal),
-  OPTP1("-L", "add linker search path", 1, opt_add_ld_arg),
-  OPT1("-Xlinker", "pass one argument to linker", 1, opt_add_ld_arg),
-  OPT2("-h", "--help", "show this help", 0, opt_help),
-  OPT1("--tokens", "dump tokens then continue", 0, opt_set_dump_tokens),
-  OPT1("--no-codegen", "parse only; do not emit code", 0, opt_set_no_codegen),
-  OPT1("--verbose", "print parsed options", 0, opt_set_verbose),
+    OPTP1("-o", "set output path", 1, opt_set_output),
+    OPT1("-c", "compile and assemble, but do not link", 0, opt_set_c),
+    OPT1("-S", "compile only; do not assemble or link", 0, opt_set_S),
+    OPT1("-E", "preprocess only", 0, opt_set_E),
+    OPTP1("-I", "add include search path", 1, opt_add_include_path),
+    OPTP1("-D", "define macro (NAME or NAME=VALUE)", 1, opt_add_define),
+    OPTP1("-Wl", "pass comma-separated args to linker", 1, opt_add_Wl),
+    OPTP1("-l", "link with library (pass through to linker)", 1,
+          opt_add_ld_arg_literal),
+    OPTP1("-L", "add linker search path", 1, opt_add_ld_arg),
+    OPT1("-Xlinker", "pass one argument to linker", 1, opt_add_ld_arg),
+    OPT2("-h", "--help", "show this help", 0, opt_help),
+    OPT1("--tokens", "dump tokens then continue", 0, opt_set_dump_tokens),
+    OPT1("--no-codegen", "parse only; do not emit code", 0, opt_set_no_codegen),
+    OPT1("--verbose", "print parsed options", 0, opt_set_verbose),
 };
 
 static const size_t specs_len = sizeof(specs) / sizeof(*specs);
@@ -495,7 +496,8 @@ static void validate_options(const Options *opt) {
 // In addition, we expose NEWLINE/EOF tokens to make directive parsing easier.
 //
 // Whitespace/comments handling policy (important for directive parsing):
-// - Spaces/tabs/etc (excluding '\n') are skipped and recorded via `has_space=true`
+// - Spaces/tabs/etc (excluding '\n') are skipped and recorded via
+// `has_space=true`
 //   on the *next* returned non-NEWLINE token.
 // - `//` comments are skipped up to (but not including) the terminating '\n'.
 // - `/* ... */` comments are skipped, but NEWLINE tokens are still produced for
@@ -521,13 +523,33 @@ typedef struct {
 } PPFile;
 
 typedef struct PPToken PPToken;
+
+// Source location for preprocessing tokens (used for diagnostics and macro
+// backtraces).
+typedef struct {
+  const char *path;
+  long byte_offset; // from file->contents
+  int line_no;      // 1-based
+  int col_no;       // 1-based
+} PPSrcLoc;
+
+typedef struct PPOrigin PPOrigin;
+struct PPOrigin {
+  const char *macro_name;
+  PPSrcLoc expanded_at; // macro invocation site
+  PPSrcLoc defined_at;  // macro definition site (optional)
+  PPOrigin *parent;     // next frame (outer expansion / original origin)
+};
+
 struct PPToken {
   PPTokenKind kind;
+  unsigned id; // monotonically increasing within a translation unit
   const char *loc;
   int len;
-  int line_no;
   bool at_bol;
   bool has_space;
+  PPSrcLoc spelling; // where the token's text is spelled
+  PPOrigin *origin;  // macro expansion backtrace (owned by this token)
   PPToken *next;
 };
 
@@ -540,9 +562,11 @@ typedef struct {
   PPFile *file;
   const char *cur;
   int line_no;
+  const char *line_start;
   bool at_bol;
   bool has_space;
   PPCommentMode comment_mode;
+  unsigned next_tok_id;
 } PPTokenizer;
 
 static PPFile pp_read_file(const char *path) {
@@ -610,19 +634,48 @@ static PPFile pp_read_file(const char *path) {
   return f;
 }
 
-static void pp_free_file(PPFile *file) {
-  free(file->contents);
-}
+static void pp_free_file(PPFile *file) { free(file->contents); }
 
 static void pp_tokenizer_init(PPTokenizer *tz, PPFile *file) {
   *tz = (PPTokenizer){
       .file = file,
       .cur = file->contents,
       .line_no = 1,
+      .line_start = file->contents,
       .at_bol = true,
       .has_space = false,
       .comment_mode = PP_COMMENT_NONE,
+      .next_tok_id = 1,
   };
+}
+
+static PPSrcLoc pp_make_srcloc(PPTokenizer *tz, const char *p) {
+  return (PPSrcLoc){
+      .path = tz->file->path,
+      .byte_offset = (long)(p - tz->file->contents),
+      .line_no = tz->line_no,
+      .col_no = (int)(p - tz->line_start) + 1,
+  };
+}
+
+static bool pp_srcloc_is_valid(PPSrcLoc loc) {
+  return loc.path && loc.line_no > 0 && loc.col_no > 0;
+}
+
+static void pp_fprint_srcloc(FILE *out, PPSrcLoc loc) {
+  if (!pp_srcloc_is_valid(loc)) {
+    fprintf(out, "<unknown>");
+    return;
+  }
+  fprintf(out, "%s:%d:%d", loc.path, loc.line_no, loc.col_no);
+}
+
+static void pp_origin_free(PPOrigin *o) {
+  while (o) {
+    PPOrigin *next = o->parent;
+    free(o);
+    o = next;
+  }
 }
 
 static bool pp_is_space_non_nl(int c) {
@@ -696,7 +749,7 @@ static bool pp_is_punctuator_first(int c) {
 }
 
 static bool pp_is_string_or_char_start(const char *p, int *prefix_len_out,
-                                        char *quote_out) {
+                                       char *quote_out) {
   // Recognize starts of:
   // - string-literal: encoding-prefix(opt) "..."
   // - character-constant: (L|u|U)(opt) '...'
@@ -766,22 +819,22 @@ static const char *pp_tok_kind_name(PPTokenKind k) {
 }
 
 static PPToken pp_make_tok(PPTokenizer *tz, PPTokenKind kind, const char *start,
-                           const char *end, int line_no, bool at_bol,
-                           bool has_space) {
-  (void)tz;
+                           const char *end, bool at_bol, bool has_space) {
   return (PPToken){
       .kind = kind,
+      .id = tz->next_tok_id++,
       .loc = start,
       .len = (int)(end - start),
-      .line_no = line_no,
       .at_bol = at_bol,
       .has_space = has_space,
+      .spelling = pp_make_srcloc(tz, start),
+      .origin = NULL,
       .next = NULL,
   };
 }
 
-static bool pp_try_quoted_literal_end(PPTokenizer *tz, const char *p, char quote,
-                                      const char **end_out) {
+static bool pp_try_quoted_literal_end(PPTokenizer *tz, const char *p,
+                                      char quote, const char **end_out) {
   // p points to the first character after opening quote.
   while (*p && *p != quote) {
     if (*p == '\\' && p[1]) {
@@ -800,8 +853,8 @@ static bool pp_try_quoted_literal_end(PPTokenizer *tz, const char *p, char quote
 
 static bool pp_try_pp_number_end(const char *p, const char **end_out) {
   if (!(pp_is_digit((unsigned char)*p) ||
-        (*p == '.' && pp_is_digit((unsigned char)p[1])))) 
-        // only punctuator and pp_number has "."
+        (*p == '.' && pp_is_digit((unsigned char)p[1]))))
+    // only punctuator and pp_number has "."
     return false;
 
   // C11 6.4.8: pp-number
@@ -875,8 +928,7 @@ static bool pp_try_string_or_char(PPTokenizer *tz, const char *p,
 
   PPTokenKind kind =
       (quote == '"') ? PPTOK_STRING_LITERAL : PPTOK_CHARACTER_CONSTANT;
-  *out =
-      pp_make_tok(tz, kind, start, end, tz->line_no, tok_at_bol, tok_has_space);
+  *out = pp_make_tok(tz, kind, start, end, tok_at_bol, tok_has_space);
   tz->cur = end;
   tz->at_bol = false;
   tz->has_space = false;
@@ -893,8 +945,8 @@ static bool pp_try_pp_number(PPTokenizer *tz, const char *p, bool tok_at_bol,
   const char *end = NULL;
   if (!pp_try_pp_number_end(p, &end))
     return false;
-  *out = pp_make_tok(tz, PPTOK_PP_NUMBER, start, end, tz->line_no, tok_at_bol,
-                     tok_has_space);
+  *out =
+      pp_make_tok(tz, PPTOK_PP_NUMBER, start, end, tok_at_bol, tok_has_space);
   tz->cur = end;
   tz->at_bol = false;
   tz->has_space = false;
@@ -910,8 +962,8 @@ static bool pp_try_identifier(PPTokenizer *tz, const char *p, bool tok_at_bol,
   const char *end = NULL;
   if (!pp_try_identifier_end(p, &end))
     return false;
-  *out = pp_make_tok(tz, PPTOK_IDENTIFIER, start, end, tz->line_no, tok_at_bol,
-                     tok_has_space);
+  *out =
+      pp_make_tok(tz, PPTOK_IDENTIFIER, start, end, tok_at_bol, tok_has_space);
   tz->cur = end;
   tz->at_bol = false;
   tz->has_space = false;
@@ -925,8 +977,7 @@ static bool pp_try_punctuator(PPTokenizer *tz, const char *p, bool tok_at_bol,
 
   int n = pp_read_punct_len(p);
   const char *end = p + n;
-  *out = pp_make_tok(tz, PPTOK_PUNCTUATOR, p, end, tz->line_no, tok_at_bol,
-                     tok_has_space);
+  *out = pp_make_tok(tz, PPTOK_PUNCTUATOR, p, end, tok_at_bol, tok_has_space);
   tz->cur = end;
   tz->at_bol = false;
   tz->has_space = false;
@@ -937,10 +988,10 @@ static bool pp_try_newline(PPTokenizer *tz, const char *p, PPToken *out) {
   if (*p != '\n')
     return false;
 
-  *out = pp_make_tok(tz, PPTOK_NEWLINE, p, p + 1, tz->line_no, tz->at_bol,
-                     tz->has_space);
+  *out = pp_make_tok(tz, PPTOK_NEWLINE, p, p + 1, tz->at_bol, tz->has_space);
   tz->cur = p + 1;
   tz->line_no++;
+  tz->line_start = tz->cur;
   tz->at_bol = true;
   tz->has_space = false;
   return true;
@@ -950,8 +1001,7 @@ static bool pp_try_eof(PPTokenizer *tz, const char *p, PPToken *out) {
   if (*p != '\0')
     return false;
 
-  *out =
-      pp_make_tok(tz, PPTOK_EOF, p, p, tz->line_no, tz->at_bol, tz->has_space);
+  *out = pp_make_tok(tz, PPTOK_EOF, p, p, tz->at_bol, tz->has_space);
   tz->at_bol = false;
   tz->has_space = false;
   return true;
@@ -1009,7 +1059,8 @@ static bool pp_try_in_block_comment(PPTokenizer *tz, PPToken *out) {
   // - Comments are removed before tokenization: C11 5.1.1.2 translation phase 3
   //   replaces each comment with a single space.
   // - We still surface '\n' as PPTOK_NEWLINE to support directive parsing in
-  //   our preprocessor implementation (directives are line-based; see C11 6.10).
+  //   our preprocessor implementation (directives are line-based; see
+  //   C11 6.10).
   const char *p = tz->cur;
 
   for (;;) {
@@ -1024,10 +1075,11 @@ static bool pp_try_in_block_comment(PPTokenizer *tz, PPToken *out) {
     }
 
     if (*p == '\n') {
-      *out = pp_make_tok(tz, PPTOK_NEWLINE, p, p + 1, tz->line_no, tz->at_bol,
-                         tz->has_space);
+      *out =
+          pp_make_tok(tz, PPTOK_NEWLINE, p, p + 1, tz->at_bol, tz->has_space);
       tz->cur = p + 1;
       tz->line_no++;
+      tz->line_start = tz->cur;
       tz->at_bol = true;
       tz->has_space = false;
       return true;
@@ -1099,8 +1151,7 @@ static bool pp_try_next_preprocessing_token(PPTokenizer *tz, PPToken *out) {
     tz->cur = p + 1;
     tz->at_bol = false;
     tz->has_space = false;
-    *out = pp_make_tok(tz, PPTOK_OTHER, p, p + 1, tz->line_no, tok_at_bol,
-                       tok_has_space);
+    *out = pp_make_tok(tz, PPTOK_OTHER, p, p + 1, tok_at_bol, tok_has_space);
     return true;
   }
 }
@@ -1142,6 +1193,7 @@ static PPToken *tokenlize(PPFile *file) {
 static void free_pptokens(PPToken *tok) {
   while (tok) {
     PPToken *next = tok->next;
+    pp_origin_free(tok->origin);
     free(tok);
     tok = next;
   }
@@ -1175,8 +1227,9 @@ int main(int argc, char **argv) {
 
       for (PPToken *tok = pp; tok; tok = tok->next) {
         if (opt.dump_tokens) {
-          fprintf(stderr, "%s:%d: %s%s%s", path, tok->line_no,
-                  pp_tok_kind_name(tok->kind), tok->at_bol ? "(BOL)" : "",
+          pp_fprint_srcloc(stderr, tok->spelling);
+          fprintf(stderr, ": %s%s%s", pp_tok_kind_name(tok->kind),
+                  tok->at_bol ? "(BOL)" : "",
                   tok->kind == PPTOK_NEWLINE ? "" : ": ");
           if (tok->kind != PPTOK_NEWLINE)
             fwrite(tok->loc, 1, (size_t)tok->len, stderr);
