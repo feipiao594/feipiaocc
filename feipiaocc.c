@@ -1175,9 +1175,11 @@ int main(int argc, char **argv) {
 
       for (PPToken *tok = pp; tok; tok = tok->next) {
         if (opt.dump_tokens) {
-          fprintf(stderr, "%s:%d: %s%s: ", path, tok->line_no,
-                  pp_tok_kind_name(tok->kind), tok->at_bol ? "(BOL)" : "");
-          fwrite(tok->loc, 1, (size_t)tok->len, stderr);
+          fprintf(stderr, "%s:%d: %s%s%s", path, tok->line_no,
+                  pp_tok_kind_name(tok->kind), tok->at_bol ? "(BOL)" : "",
+                  tok->kind == PPTOK_NEWLINE ? "" : ": ");
+          if (tok->kind != PPTOK_NEWLINE)
+            fwrite(tok->loc, 1, (size_t)tok->len, stderr);
           fputc('\n', stderr);
         }
       }
