@@ -1,5 +1,7 @@
 #include <ctype.h>
 #include <stdbool.h>
+#include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -519,6 +521,7 @@ typedef enum {
 
 typedef struct {
   const char *path;
+  char *path_buf; // owned copy of path (or NULL if not owned)
   char *contents; // NUL-terminated, normalized to '\n'
 } PPFile;
 
@@ -541,6 +544,12 @@ struct PPOrigin {
   PPOrigin *parent;     // next frame (outer expansion / original origin)
 };
 
+typedef struct PPHideSet PPHideSet;
+struct PPHideSet {
+  const char *name; // interned pointer
+  PPHideSet *next;
+};
+
 struct PPToken {
   PPTokenKind kind;
   unsigned id; // monotonically increasing within a translation unit
@@ -550,6 +559,7 @@ struct PPToken {
   bool has_space;
   PPSrcLoc spelling; // where the token's text is spelled
   PPOrigin *origin;  // macro expansion backtrace (owned by this token)
+  PPHideSet *hideset;
   PPToken *next;
 };
 
@@ -630,11 +640,20 @@ static PPFile pp_read_file(const char *path) {
   buf[nread] = '\0';
   memset(buf + nread + 1, 0, PP_FILE_PADDING);
 
-  PPFile f = {.path = path, .contents = buf};
+  size_t pn = strlen(path) + 1;
+  char *path_buf = malloc(pn);
+  if (!path_buf)
+    die_oom("copying file path");
+  memcpy(path_buf, path, pn);
+
+  PPFile f = {.path = path_buf, .path_buf = path_buf, .contents = buf};
   return f;
 }
 
-static void pp_free_file(PPFile *file) { free(file->contents); }
+static void pp_free_file(PPFile *file) {
+  free(file->path_buf);
+  free(file->contents);
+}
 
 static void pp_tokenizer_init(PPTokenizer *tz, PPFile *file) {
   *tz = (PPTokenizer){
@@ -829,6 +848,7 @@ static PPToken pp_make_tok(PPTokenizer *tz, PPTokenKind kind, const char *start,
       .has_space = has_space,
       .spelling = pp_make_srcloc(tz, start),
       .origin = NULL,
+      .hideset = NULL,
       .next = NULL,
   };
 }
@@ -1199,6 +1219,257 @@ static void free_pptokens(PPToken *tok) {
   }
 }
 
+static bool pp_tok_text_is(PPToken *tok, const char *s) {
+  if (!tok || !s)
+    return false;
+  size_t n = strlen(s);
+  return tok->len == (int)n && !memcmp(tok->loc, s, n);
+}
+
+static bool pp_is_directive_start(PPToken *tok) {
+  // Directives are recognized only at the beginning of a logical line (after
+  // optional whitespace). Our tokenizer removes whitespace tokens; if a line
+  // begins with spaces, the '#' token still has at_bol=true and has_space=true.
+  return tok && tok->at_bol && tok->kind == PPTOK_PUNCTUATOR &&
+         (pp_tok_text_is(tok, "#") || pp_tok_text_is(tok, "%:"));
+}
+
+static PPToken *pp_skip_to_line_end(PPToken *tok) {
+  while (tok && tok->kind != PPTOK_EOF && tok->kind != PPTOK_NEWLINE)
+    tok = tok->next;
+  if (tok && tok->kind == PPTOK_NEWLINE)
+    tok = tok->next;
+  return tok;
+}
+
+static PPOrigin *pp_origin_clone(const PPOrigin *o) {
+  if (!o)
+    return NULL;
+
+  PPOrigin *head = NULL;
+  PPOrigin **tail = &head;
+  for (const PPOrigin *p = o; p; p = p->parent) {
+    PPOrigin *node = calloc(1, sizeof(*node));
+    if (!node)
+      die_oom("allocating macro origin");
+    *node = *p;
+    node->parent = NULL;
+    *tail = node;
+    tail = &node->parent;
+  }
+  return head;
+}
+
+static PPToken *pp_clone_tok(const PPToken *tok) {
+  PPToken *node = calloc(1, sizeof(*node));
+  if (!node)
+    die_oom("allocating preprocessing token");
+  *node = *tok;
+  node->next = NULL;
+  node->origin = pp_origin_clone(tok->origin);
+  return node;
+}
+
+static void pp_die_tok(PPToken *tok, const char *msg) {
+  if (tok)
+    DIE("%s:%d:%d: %s", tok->spelling.path, tok->spelling.line_no,
+        tok->spelling.col_no, msg);
+  DIE("<unknown>:0:0: %s", msg);
+}
+
+static bool pp_is_empty_directive(PPToken *hash_tok) {
+  if (!pp_is_directive_start(hash_tok))
+    return false;
+  return !hash_tok->next || hash_tok->next->kind == PPTOK_NEWLINE ||
+         hash_tok->next->kind == PPTOK_EOF;
+}
+
+static PPToken *pp_directive_name(PPToken *hash_tok) {
+  if (!pp_is_directive_start(hash_tok))
+    return NULL;
+  PPToken *p = hash_tok->next;
+  if (!p || p->kind == PPTOK_NEWLINE || p->kind == PPTOK_EOF)
+    return NULL;
+  if (p->kind != PPTOK_IDENTIFIER)
+    return NULL;
+  return p;
+}
+
+static bool pp_directive_is(PPToken *hash_tok, const char *name) {
+  PPToken *p = pp_directive_name(hash_tok);
+  return p && pp_tok_text_is(p, name);
+}
+
+static bool pp_is_endif_like(PPToken *hash_tok) {
+  return pp_directive_is(hash_tok, "elif") || pp_directive_is(hash_tok, "else") ||
+         pp_directive_is(hash_tok, "endif");
+}
+
+static PPToken *pp_copy_line(PPToken *tok, PPToken **out_cur, bool emit) {
+  while (tok && tok->kind != PPTOK_EOF && tok->kind != PPTOK_NEWLINE) {
+    if (emit) {
+      (*out_cur)->next = pp_clone_tok(tok);
+      *out_cur = (*out_cur)->next;
+    }
+    tok = tok->next;
+  }
+  if (tok && tok->kind == PPTOK_NEWLINE) {
+    if (emit) {
+      (*out_cur)->next = pp_clone_tok(tok);
+      *out_cur = (*out_cur)->next;
+    }
+    tok = tok->next;
+  }
+  return tok;
+}
+
+static PPToken *pp_parse_group(PPToken *tok, PPToken **out_cur, bool emit_text,
+                               bool stop_on_endif_like);
+
+static PPToken *pp_handle_text_line(PPToken *tok, PPToken **out_cur,
+                                    bool emit_text) {
+  return pp_copy_line(tok, out_cur, emit_text);
+  // without macro
+}
+
+static PPToken *pp_handle_empty_directive(PPToken *tok) {
+  // control-line: "#" new-line
+  return pp_skip_to_line_end(tok);
+}
+
+static PPToken *pp_handle_include(PPToken *tok) { return pp_skip_to_line_end(tok); }
+
+static PPToken *pp_handle_include_next(PPToken *tok) {
+  return pp_skip_to_line_end(tok);
+}
+
+static PPToken *pp_handle_define(PPToken *tok) { return pp_skip_to_line_end(tok); }
+
+static PPToken *pp_handle_undef(PPToken *tok) { return pp_skip_to_line_end(tok); }
+
+static PPToken *pp_handle_line(PPToken *tok) { return pp_skip_to_line_end(tok); }
+
+static PPToken *pp_handle_error(PPToken *tok) { return pp_skip_to_line_end(tok); }
+
+static PPToken *pp_handle_pragma(PPToken *tok) { return pp_skip_to_line_end(tok); }
+
+static PPToken *pp_handle_non_directive(PPToken *tok) { return pp_skip_to_line_end(tok); }
+
+static PPToken *pp_handle_control_line(PPToken *tok) {
+  if (pp_is_empty_directive(tok))
+    return pp_handle_empty_directive(tok);
+  if (pp_directive_is(tok, "include"))
+    return pp_handle_include(tok);
+  if (pp_directive_is(tok, "include_next"))
+    return pp_handle_include_next(tok);
+  if (pp_directive_is(tok, "define"))
+    return pp_handle_define(tok);
+  if (pp_directive_is(tok, "undef"))
+    return pp_handle_undef(tok);
+  if (pp_directive_is(tok, "line"))
+    return pp_handle_line(tok);
+  if (pp_directive_is(tok, "error"))
+    return pp_handle_error(tok);
+  if (pp_directive_is(tok, "pragma"))
+    return pp_handle_pragma(tok);
+
+  // conditionals are handled elsewhere; unknown directives are non-directive.
+  return pp_handle_non_directive(tok);
+}
+
+static PPToken *pp_handle_if_section(PPToken *tok, PPToken **out_cur) {
+  // Parse:
+  //   if-group (elif-group)* (else-group)? endif-line
+  // We do not evaluate expressions, so we also do not emit any controlled text.
+  PPSrcLoc started_at = tok->spelling;
+
+  if (!(pp_directive_is(tok, "if") || pp_directive_is(tok, "ifdef") ||
+        pp_directive_is(tok, "ifndef")))
+    pp_die_tok(tok, "internal error: expected #if/#ifdef/#ifndef");
+
+  // if-line
+  tok = pp_skip_to_line_end(tok);
+  tok = pp_parse_group(tok, out_cur, /*emit_text=*/false,
+                       /*stop_on_endif_like=*/true);
+
+  // elif-groupsopt
+  for (;;) {
+    if (!tok || tok->kind == PPTOK_EOF)
+      break;
+    if (!pp_directive_is(tok, "elif"))
+      break;
+    tok = pp_skip_to_line_end(tok);
+    tok = pp_parse_group(tok, out_cur, /*emit_text=*/false,
+                         /*stop_on_endif_like=*/true);
+  }
+
+  // else-groupopt
+  if (tok && pp_directive_is(tok, "else")) {
+    tok = pp_skip_to_line_end(tok);
+    tok = pp_parse_group(tok, out_cur, /*emit_text=*/false,
+                         /*stop_on_endif_like=*/true);
+  }
+
+  // endif-line
+  if (!tok || tok->kind == PPTOK_EOF) {
+    DIE("%s:%d:%d: unterminated #if (missing #endif)", started_at.path,
+        started_at.line_no, started_at.col_no);
+  }
+
+  if (!pp_directive_is(tok, "endif"))
+    pp_die_tok(tok, "expected #endif");
+  tok = pp_skip_to_line_end(tok);
+
+  return tok;
+}
+
+static PPToken *pp_parse_group(PPToken *tok, PPToken **out_cur, bool emit_text,
+                               bool stop_on_endif_like) {
+  // Parse groupopt/group: a sequence of group-part.
+  // When stop_on_endif_like is true, we stop before a line that begins with
+  // #elif/#else/#endif (so the enclosing if-section parser can consume it).
+  while (tok && tok->kind != PPTOK_EOF) {
+    if (stop_on_endif_like && pp_is_directive_start(tok)) {
+      if (pp_is_endif_like(tok))
+        return tok;
+    }
+
+    if (!pp_is_directive_start(tok)) {
+      tok = pp_handle_text_line(tok, out_cur, emit_text);
+      continue;
+    }
+
+    if (pp_directive_is(tok, "if") || pp_directive_is(tok, "ifdef") ||
+        pp_directive_is(tok, "ifndef")) {
+      tok = pp_handle_if_section(tok, out_cur);
+      continue;
+    }
+
+    if (pp_is_endif_like(tok)) {
+      // These should have been caught by stop_on_endif_like.
+      pp_die_tok(tok, "stray conditional directive");
+    }
+
+    tok = pp_handle_control_line(tok);
+  }
+  return tok;
+}
+
+static PPToken *preprocess(PPToken *in) {
+  PPToken head = {};
+  PPToken *out_cur = &head;
+
+  PPToken *tok = pp_parse_group(in, &out_cur, /*emit_text=*/true,
+                                /*stop_on_endif_like=*/false);
+
+  if (!tok || tok->kind != PPTOK_EOF)
+    pp_die_tok(tok, "internal error: expected EOF after preprocessing-file");
+
+  out_cur->next = pp_clone_tok(tok);
+  out_cur = out_cur->next;
+  return head.next;
+}
+
 /* section: lexical analysis */
 
 /* section: main function */
@@ -1224,9 +1495,10 @@ int main(int argc, char **argv) {
       PPFile f = pp_read_file(path);
 
       PPToken *pp = tokenlize(&f);
+      PPToken *pp2 = NULL;
 
-      for (PPToken *tok = pp; tok; tok = tok->next) {
-        if (opt.dump_tokens) {
+      if (opt.dump_tokens) {
+        for (PPToken *tok = pp; tok; tok = tok->next) {
           pp_fprint_srcloc(stderr, tok->spelling);
           fprintf(stderr, ": %s%s%s", pp_tok_kind_name(tok->kind),
                   tok->at_bol ? "(BOL)" : "",
@@ -1237,6 +1509,20 @@ int main(int argc, char **argv) {
         }
       }
 
+      if (opt.opt_E) {
+        pp2 = preprocess(pp);
+        for (PPToken *tok = pp2; tok; tok = tok->next) {
+          if (tok->kind == PPTOK_NEWLINE) {
+            fputc('\n', stdout);
+          } else {
+            if (tok->has_space)
+              fputc(' ', stdout);
+            fwrite(tok->loc, 1, (size_t)tok->len, stdout);
+          }
+        }
+      }
+
+      free_pptokens(pp2);
       free_pptokens(pp);
       pp_free_file(&f);
     }
