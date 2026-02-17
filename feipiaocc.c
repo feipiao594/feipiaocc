@@ -1,6 +1,5 @@
 #include <ctype.h>
 #include <stdbool.h>
-#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -697,6 +696,14 @@ static void pp_origin_free(PPOrigin *o) {
   }
 }
 
+static void pp_hideset_free(PPHideSet *hs) {
+  while (hs) {
+    PPHideSet *next = hs->next;
+    free(hs);
+    hs = next;
+  }
+}
+
 static bool pp_is_space_non_nl(int c) {
   return c == ' ' || c == '\t' || c == '\v' || c == '\f' || c == '\r';
 }
@@ -1214,9 +1221,18 @@ static void free_pptokens(PPToken *tok) {
   while (tok) {
     PPToken *next = tok->next;
     pp_origin_free(tok->origin);
+    pp_hideset_free(tok->hideset);
     free(tok);
     tok = next;
   }
+}
+
+static void pp_free_tok(PPToken *tok) {
+  if (!tok)
+    return;
+  pp_origin_free(tok->origin);
+  pp_hideset_free(tok->hideset);
+  free(tok);
 }
 
 static bool pp_tok_text_is(PPToken *tok, const char *s) {
@@ -1260,6 +1276,23 @@ static PPOrigin *pp_origin_clone(const PPOrigin *o) {
   return head;
 }
 
+static PPHideSet *pp_hideset_clone(const PPHideSet *hs) {
+  if (!hs)
+    return NULL;
+  PPHideSet *head = NULL;
+  PPHideSet **tail = &head;
+  for (const PPHideSet *p = hs; p; p = p->next) {
+    PPHideSet *node = calloc(1, sizeof(*node));
+    if (!node)
+      die_oom("allocating hideset");
+    *node = *p;
+    node->next = NULL;
+    *tail = node;
+    tail = &node->next;
+  }
+  return head;
+}
+
 static PPToken *pp_clone_tok(const PPToken *tok) {
   PPToken *node = calloc(1, sizeof(*node));
   if (!node)
@@ -1267,6 +1300,7 @@ static PPToken *pp_clone_tok(const PPToken *tok) {
   *node = *tok;
   node->next = NULL;
   node->origin = pp_origin_clone(tok->origin);
+  node->hideset = pp_hideset_clone(tok->hideset);
   return node;
 }
 
@@ -1305,35 +1339,379 @@ static bool pp_is_endif_like(PPToken *hash_tok) {
          pp_directive_is(hash_tok, "endif");
 }
 
-static PPToken *pp_copy_line(PPToken *tok, PPToken **out_cur, bool emit) {
-  while (tok && tok->kind != PPTOK_EOF && tok->kind != PPTOK_NEWLINE) {
-    if (emit) {
-      (*out_cur)->next = pp_clone_tok(tok);
-      *out_cur = (*out_cur)->next;
-    }
-    tok = tok->next;
-  }
-  if (tok && tok->kind == PPTOK_NEWLINE) {
-    if (emit) {
-      (*out_cur)->next = pp_clone_tok(tok);
-      *out_cur = (*out_cur)->next;
-    }
-    tok = tok->next;
-  }
-  return tok;
+static char *pp_strndup(const char *p, int len) {
+  char *s = malloc((size_t)len + 1);
+  if (!s)
+    die_oom("copying string");
+  memcpy(s, p, (size_t)len);
+  s[len] = '\0';
+  return s;
 }
 
-static PPToken *pp_parse_group(PPToken *tok, PPToken **out_cur, bool emit_text,
-                               bool stop_on_endif_like);
+static bool pp_hideset_contains(const PPHideSet *hs, const char *s, int len) {
+  for (const PPHideSet *p = hs; p; p = p->next) {
+    if ((int)strlen(p->name) == len && !strncmp(p->name, s, (size_t)len))
+      return true;
+  }
+  return false;
+}
 
-static PPToken *pp_handle_text_line(PPToken *tok, PPToken **out_cur,
-                                    bool emit_text) {
-  return pp_copy_line(tok, out_cur, emit_text);
-  // without macro
+static PPHideSet *pp_hideset_add_name(PPHideSet *hs, const char *name) {
+  int len = (int)strlen(name);
+  if (pp_hideset_contains(hs, name, len))
+    return hs;
+  PPHideSet *node = calloc(1, sizeof(*node));
+  if (!node)
+    die_oom("allocating hideset");
+  node->name = name;
+  node->next = hs;
+  return node;
+}
+
+static PPHideSet *pp_hideset_union(const PPHideSet *a, const PPHideSet *b) {
+  PPHideSet *out = NULL;
+  for (const PPHideSet *p = a; p; p = p->next)
+    out = pp_hideset_add_name(out, p->name);
+  for (const PPHideSet *p = b; p; p = p->next)
+    out = pp_hideset_add_name(out, p->name);
+  return out;
+}
+
+typedef struct {
+  char *key;
+  int keylen;
+  void *val;
+} PPHashEntry;
+
+typedef struct {
+  PPHashEntry *buckets;
+  int capacity;
+  int used;
+} PPHashMap;
+
+#define PP_TOMBSTONE ((void *)-1)
+
+static uint64_t pp_fnv_hash(char *s, int len) {
+  uint64_t hash = 0xcbf29ce484222325ULL;
+  for (int i = 0; i < len; i++) {
+    hash *= 0x100000001b3ULL;
+    hash ^= (unsigned char)s[i];
+  }
+  return hash;
+}
+
+static bool pp_hash_match(PPHashEntry *ent, char *key, int keylen) {
+  return ent->key && ent->key != (char *)PP_TOMBSTONE && ent->keylen == keylen &&
+         !memcmp(ent->key, key, (size_t)keylen);
+}
+
+static void pp_hash_rehash(PPHashMap *map) {
+  int nkeys = 0;
+  for (int i = 0; i < map->capacity; i++)
+    if (map->buckets[i].key && map->buckets[i].key != (char *)PP_TOMBSTONE)
+      nkeys++;
+
+  int cap = map->capacity ? map->capacity : 16;
+  while ((nkeys * 100) / cap >= 50)
+    cap *= 2;
+
+  PPHashMap map2 = {};
+  map2.capacity = cap;
+  map2.buckets = calloc((size_t)cap, sizeof(PPHashEntry));
+  if (!map2.buckets)
+    die_oom("allocating hashmap");
+
+  for (int i = 0; i < map->capacity; i++) {
+    PPHashEntry *ent = &map->buckets[i];
+    if (ent->key && ent->key != (char *)PP_TOMBSTONE) {
+      // re-insert
+      uint64_t hash = pp_fnv_hash(ent->key, ent->keylen);
+      for (int j = 0; j < map2.capacity; j++) {
+        PPHashEntry *e2 = &map2.buckets[(hash + (uint64_t)j) % (uint64_t)map2.capacity];
+        if (!e2->key) {
+          *e2 = *ent;
+          map2.used++;
+          break;
+        }
+      }
+    }
+  }
+
+  free(map->buckets);
+  *map = map2;
+}
+
+static PPHashEntry *pp_hash_get_entry(PPHashMap *map, char *key, int keylen) {
+  if (!map->buckets)
+    return NULL;
+  uint64_t hash = pp_fnv_hash(key, keylen);
+  for (int i = 0; i < map->capacity; i++) {
+    PPHashEntry *ent =
+        &map->buckets[(hash + (uint64_t)i) % (uint64_t)map->capacity];
+    if (pp_hash_match(ent, key, keylen))
+      return ent;
+    if (ent->key == NULL)
+      return NULL;
+  }
+  INNER_DIE("unreachable: pp_hash_get_entry");
+}
+
+static PPHashEntry *pp_hash_get_or_insert(PPHashMap *map, char *key, int keylen) {
+  if (!map->buckets) {
+    map->capacity = 16;
+    map->buckets = calloc((size_t)map->capacity, sizeof(PPHashEntry));
+    if (!map->buckets)
+      die_oom("allocating hashmap");
+  } else if ((map->used * 100) / map->capacity >= 70) {
+    pp_hash_rehash(map);
+  }
+
+  uint64_t hash = pp_fnv_hash(key, keylen);
+  for (int i = 0; i < map->capacity; i++) {
+    PPHashEntry *ent =
+        &map->buckets[(hash + (uint64_t)i) % (uint64_t)map->capacity];
+
+    if (pp_hash_match(ent, key, keylen))
+      return ent;
+
+    if (ent->key == (char *)PP_TOMBSTONE) {
+      ent->key = key;
+      ent->keylen = keylen;
+      return ent;
+    }
+
+    if (ent->key == NULL) {
+      ent->key = key;
+      ent->keylen = keylen;
+      map->used++;
+      return ent;
+    }
+  }
+  INNER_DIE("unreachable: pp_hash_get_or_insert");
+}
+
+static void *pp_hash_get2(PPHashMap *map, char *key, int keylen) {
+  PPHashEntry *ent = pp_hash_get_entry(map, key, keylen);
+  return ent ? ent->val : NULL;
+}
+
+static void pp_hash_put2(PPHashMap *map, char *key, int keylen, void *val) {
+  PPHashEntry *ent = pp_hash_get_or_insert(map, key, keylen);
+  ent->val = val;
+}
+
+static void pp_hash_delete2(PPHashMap *map, char *key, int keylen) {
+  PPHashEntry *ent = pp_hash_get_entry(map, key, keylen);
+  if (ent)
+    ent->key = (char *)PP_TOMBSTONE;
+}
+
+typedef struct PPMacro PPMacro;
+struct PPMacro {
+  char *name;
+  PPSrcLoc defined_at;
+  PPToken *body; // replacement list tokens (no NEWLINE)
+};
+
+typedef struct {
+  PPHashMap macros;
+} PPContext;
+
+static PPToken *pp_clone_range(PPToken *tok, PPToken *end) {
+  PPToken head = {};
+  PPToken *cur = &head;
+  while (tok && tok != end) {
+    PPToken *c = pp_clone_tok(tok);
+    c->next = NULL;
+    cur = cur->next = c;
+    tok = tok->next;
+  }
+  return head.next;
+}
+
+static bool pp_is_identifier(PPToken *tok) {
+  return tok && tok->kind == PPTOK_IDENTIFIER;
+}
+
+static void pp_list_append(PPToken **out_cur, PPToken *node) {
+  (*out_cur)->next = node;
+  *out_cur = node;
+}
+
+static void pp_list_append_list(PPToken **out_cur, PPToken *list) {
+  while (list) {
+    PPToken *next = list->next;
+    list->next = NULL;
+    pp_list_append(out_cur, list);
+    list = next;
+  }
+}
+
+static PPMacro *pp_macro_find(PPContext *ctx, PPToken *tok) {
+  if (!ctx || !tok || tok->kind != PPTOK_IDENTIFIER)
+    return NULL;
+  return (PPMacro *)pp_hash_get2(&ctx->macros, (char *)tok->loc, tok->len);
+}
+
+static void pp_macro_undef(PPContext *ctx, char *name, int len) {
+  if (!ctx)
+    return;
+  PPMacro *m = (PPMacro *)pp_hash_get2(&ctx->macros, name, len);
+  if (!m)
+    return;
+  pp_hash_delete2(&ctx->macros, name, len);
+  free_pptokens(m->body);
+  free(m->name);
+  free(m);
+}
+
+static void pp_macro_define_obj(PPContext *ctx, PPSrcLoc defined_at, char *name,
+                               PPToken *body) {
+  int len = (int)strlen(name);
+  pp_macro_undef(ctx, name, len);
+
+  PPMacro *m = calloc(1, sizeof(*m));
+  if (!m)
+    die_oom("allocating macro");
+  m->name = name;
+  m->defined_at = defined_at;
+  m->body = body;
+  pp_hash_put2(&ctx->macros, m->name, len, m);
+}
+
+static PPToken *pp_expand_list(PPContext *ctx, PPToken *tok);
+
+static PPOrigin *pp_origin_new(const char *macro_name, PPSrcLoc expanded_at,
+                               PPSrcLoc defined_at, PPOrigin *parent) {
+  PPOrigin *o = calloc(1, sizeof(*o));
+  if (!o)
+    die_oom("allocating macro origin");
+  o->macro_name = macro_name;
+  o->expanded_at = expanded_at;
+  o->defined_at = defined_at;
+  o->parent = parent;
+  return o;
+}
+
+static PPToken *pp_clone_tok_for_macro(const PPToken *body_tok,
+                                       const PPToken *call_tok,
+                                       const PPMacro *m) {
+  PPToken *t = pp_clone_tok(body_tok);
+
+  // origin: one new frame for this macro expansion, parented by caller origin.
+  PPOrigin *parent = pp_origin_clone(call_tok->origin);
+  t->origin = pp_origin_new(m->name, call_tok->spelling, m->defined_at, parent);
+
+  // hideset: union(body, call) + macro name
+  PPHideSet *hs = pp_hideset_union(body_tok->hideset, call_tok->hideset);
+  hs = pp_hideset_add_name(hs, m->name);
+  pp_hideset_free(t->hideset);
+  t->hideset = hs;
+
+  return t;
+}
+
+static PPToken *pp_expand_list(PPContext *ctx, PPToken *tok) {
+  if (!ctx)
+    return tok;
+
+  PPToken head = {};
+  PPToken *out_cur = &head;
+
+  while (tok) {
+    PPToken *next = tok->next;
+    tok->next = NULL;
+
+    if (tok->kind == PPTOK_IDENTIFIER) {
+      PPMacro *m = pp_macro_find(ctx, tok);
+      if (m && !pp_hideset_contains(tok->hideset, tok->loc, tok->len)) {
+        // Replace identifier token with expanded macro body.
+        for (PPToken *bp = m->body; bp; bp = bp->next) {
+          PPToken *expanded = pp_clone_tok_for_macro(bp, tok, m);
+          expanded->next = NULL;
+          pp_list_append(&out_cur, expanded);
+        }
+        pp_free_tok(tok);
+        tok = next;
+        continue;
+      }
+    }
+
+    pp_list_append(&out_cur, tok);
+    tok = next;
+  }
+
+  // Expand recursively until no changes. Since we don't have function-like
+  // macros yet, a few fixed iterations is enough; hideset prevents loops.
+  bool changed;
+  do {
+    changed = false;
+    PPToken out2 = {};
+    PPToken *cur2 = &out2;
+
+    PPToken *p = head.next;
+    head.next = NULL;
+    while (p) {
+      PPToken *pn = p->next;
+      p->next = NULL;
+      if (p->kind == PPTOK_IDENTIFIER) {
+        PPMacro *m = pp_macro_find(ctx, p);
+        if (m && !pp_hideset_contains(p->hideset, p->loc, p->len)) {
+          changed = true;
+          for (PPToken *bp = m->body; bp; bp = bp->next) {
+            PPToken *expanded = pp_clone_tok_for_macro(bp, p, m);
+            expanded->next = NULL;
+            pp_list_append(&cur2, expanded);
+          }
+          pp_free_tok(p);
+          p = pn;
+          continue;
+        }
+      }
+      pp_list_append(&cur2, p);
+      p = pn;
+    }
+    head.next = out2.next;
+  } while (changed);
+
+  return head.next;
+}
+
+typedef struct {
+  PPContext *ctx;
+  PPToken **out_cur;
+  bool emit_text;
+  bool stop_on_endif_like;
+} PPGroupParser;
+
+static PPToken *pp_parse_group(PPGroupParser *p, PPToken *tok);
+
+static PPToken *pp_handle_text_line(PPGroupParser *p, PPToken *tok) {
+  PPToken *line_end = tok;
+  while (line_end && line_end->kind != PPTOK_EOF &&
+         line_end->kind != PPTOK_NEWLINE)
+    line_end = line_end->next;
+
+  if (!p->emit_text)
+    return pp_skip_to_line_end(tok);
+
+  // Clone the line into an owned list, expand macros in it, and append to output.
+  PPToken *line = pp_clone_range(tok, line_end);
+  line = pp_expand_list(p->ctx, line);
+  pp_list_append_list(p->out_cur, line);
+
+  if (line_end && line_end->kind == PPTOK_NEWLINE) {
+    pp_list_append(p->out_cur, pp_clone_tok(line_end));
+    return line_end->next;
+  }
+  return line_end;
 }
 
 static PPToken *pp_handle_empty_directive(PPToken *tok) {
   // control-line: "#" new-line
+  PPToken *trail = tok->next;
+  if (trail && trail->kind != PPTOK_NEWLINE && trail->kind != PPTOK_EOF)
+    pp_die_tok(trail, "extra token after #");
   return pp_skip_to_line_end(tok);
 }
 
@@ -1343,9 +1721,41 @@ static PPToken *pp_handle_include_next(PPToken *tok) {
   return pp_skip_to_line_end(tok);
 }
 
-static PPToken *pp_handle_define(PPToken *tok) { return pp_skip_to_line_end(tok); }
+static PPToken *pp_handle_define(PPContext *ctx, PPToken *tok) {
+  // control-line:
+  //   # define identifier replacement-list new-line
+  // For now we only support object-like macros.
+  PPToken *define_tok = tok->next;
+  PPToken *name_tok = define_tok ? define_tok->next : NULL;
+  if (!pp_directive_is(tok, "define") || !pp_is_identifier(name_tok))
+    pp_die_tok(tok, "malformed #define");
 
-static PPToken *pp_handle_undef(PPToken *tok) { return pp_skip_to_line_end(tok); }
+  char *name = pp_strndup(name_tok->loc, name_tok->len);
+
+  // Replacement-list: tokens up to NEWLINE.
+  PPToken *line_end = name_tok->next;
+  while (line_end && line_end->kind != PPTOK_EOF &&
+         line_end->kind != PPTOK_NEWLINE)
+    line_end = line_end->next;
+  PPToken *body = pp_clone_range(name_tok->next, line_end);
+
+  pp_macro_define_obj(ctx, name_tok->spelling, name, body);
+  return pp_skip_to_line_end(tok);
+}
+
+static PPToken *pp_handle_undef(PPContext *ctx, PPToken *tok) {
+  // control-line:
+  //   # undef identifier new-line
+  PPToken *undef_tok = tok->next;
+  PPToken *name_tok = undef_tok ? undef_tok->next : NULL;
+  if (!pp_directive_is(tok, "undef") || !pp_is_identifier(name_tok))
+    pp_die_tok(tok, "malformed #undef");
+  pp_macro_undef(ctx, (char *)name_tok->loc, name_tok->len);
+  PPToken *trail = name_tok->next;
+  if (trail && trail->kind != PPTOK_NEWLINE && trail->kind != PPTOK_EOF)
+    pp_die_tok(trail, "extra token after #undef");
+  return pp_skip_to_line_end(tok);
+}
 
 static PPToken *pp_handle_line(PPToken *tok) { return pp_skip_to_line_end(tok); }
 
@@ -1355,7 +1765,7 @@ static PPToken *pp_handle_pragma(PPToken *tok) { return pp_skip_to_line_end(tok)
 
 static PPToken *pp_handle_non_directive(PPToken *tok) { return pp_skip_to_line_end(tok); }
 
-static PPToken *pp_handle_control_line(PPToken *tok) {
+static PPToken *pp_handle_control_line(PPGroupParser *p, PPToken *tok) {
   if (pp_is_empty_directive(tok))
     return pp_handle_empty_directive(tok);
   if (pp_directive_is(tok, "include"))
@@ -1363,9 +1773,9 @@ static PPToken *pp_handle_control_line(PPToken *tok) {
   if (pp_directive_is(tok, "include_next"))
     return pp_handle_include_next(tok);
   if (pp_directive_is(tok, "define"))
-    return pp_handle_define(tok);
+    return pp_handle_define(p->ctx, tok);
   if (pp_directive_is(tok, "undef"))
-    return pp_handle_undef(tok);
+    return pp_handle_undef(p->ctx, tok);
   if (pp_directive_is(tok, "line"))
     return pp_handle_line(tok);
   if (pp_directive_is(tok, "error"))
@@ -1377,7 +1787,7 @@ static PPToken *pp_handle_control_line(PPToken *tok) {
   return pp_handle_non_directive(tok);
 }
 
-static PPToken *pp_handle_if_section(PPToken *tok, PPToken **out_cur) {
+static PPToken *pp_handle_if_section(PPGroupParser *p, PPToken *tok) {
   // Parse:
   //   if-group (elif-group)* (else-group)? endif-line
   // We do not evaluate expressions, so we also do not emit any controlled text.
@@ -1389,8 +1799,12 @@ static PPToken *pp_handle_if_section(PPToken *tok, PPToken **out_cur) {
 
   // if-line
   tok = pp_skip_to_line_end(tok);
-  tok = pp_parse_group(tok, out_cur, /*emit_text=*/false,
-                       /*stop_on_endif_like=*/true);
+  // pp_handle_if_section is syntax-only for now, so we don't expand or emit
+  // anything in controlled regions.
+  PPGroupParser sub = *p;
+  sub.emit_text = false;
+  sub.stop_on_endif_like = true;
+  tok = pp_parse_group(&sub, tok);
 
   // elif-groupsopt
   for (;;) {
@@ -1399,15 +1813,13 @@ static PPToken *pp_handle_if_section(PPToken *tok, PPToken **out_cur) {
     if (!pp_directive_is(tok, "elif"))
       break;
     tok = pp_skip_to_line_end(tok);
-    tok = pp_parse_group(tok, out_cur, /*emit_text=*/false,
-                         /*stop_on_endif_like=*/true);
+    tok = pp_parse_group(&sub, tok);
   }
 
   // else-groupopt
   if (tok && pp_directive_is(tok, "else")) {
     tok = pp_skip_to_line_end(tok);
-    tok = pp_parse_group(tok, out_cur, /*emit_text=*/false,
-                         /*stop_on_endif_like=*/true);
+    tok = pp_parse_group(&sub, tok);
   }
 
   // endif-line
@@ -1423,25 +1835,24 @@ static PPToken *pp_handle_if_section(PPToken *tok, PPToken **out_cur) {
   return tok;
 }
 
-static PPToken *pp_parse_group(PPToken *tok, PPToken **out_cur, bool emit_text,
-                               bool stop_on_endif_like) {
+static PPToken *pp_parse_group(PPGroupParser *p, PPToken *tok) {
   // Parse groupopt/group: a sequence of group-part.
   // When stop_on_endif_like is true, we stop before a line that begins with
   // #elif/#else/#endif (so the enclosing if-section parser can consume it).
   while (tok && tok->kind != PPTOK_EOF) {
-    if (stop_on_endif_like && pp_is_directive_start(tok)) {
+    if (p->stop_on_endif_like && pp_is_directive_start(tok)) {
       if (pp_is_endif_like(tok))
         return tok;
     }
 
     if (!pp_is_directive_start(tok)) {
-      tok = pp_handle_text_line(tok, out_cur, emit_text);
+      tok = pp_handle_text_line(p, tok);
       continue;
     }
 
     if (pp_directive_is(tok, "if") || pp_directive_is(tok, "ifdef") ||
         pp_directive_is(tok, "ifndef")) {
-      tok = pp_handle_if_section(tok, out_cur);
+      tok = pp_handle_if_section(p, tok);
       continue;
     }
 
@@ -1450,7 +1861,7 @@ static PPToken *pp_parse_group(PPToken *tok, PPToken **out_cur, bool emit_text,
       pp_die_tok(tok, "stray conditional directive");
     }
 
-    tok = pp_handle_control_line(tok);
+    tok = pp_handle_control_line(p, tok);
   }
   return tok;
 }
@@ -1459,8 +1870,14 @@ static PPToken *preprocess(PPToken *in) {
   PPToken head = {};
   PPToken *out_cur = &head;
 
-  PPToken *tok = pp_parse_group(in, &out_cur, /*emit_text=*/true,
-                                /*stop_on_endif_like=*/false);
+  PPContext ctx = {};
+  PPGroupParser p = {
+      .ctx = &ctx,
+      .out_cur = &out_cur,
+      .emit_text = true,
+      .stop_on_endif_like = false,
+  };
+  PPToken *tok = pp_parse_group(&p, in);
 
   if (!tok || tok->kind != PPTOK_EOF)
     pp_die_tok(tok, "internal error: expected EOF after preprocessing-file");
